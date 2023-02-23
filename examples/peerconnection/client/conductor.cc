@@ -67,6 +67,18 @@ class DummySetSessionDescriptionObserver
   }
 };
 
+bool srs_filter_cameras_without_facetime(webrtc::VideoCaptureModule::DeviceInfo* info, uint32_t deviceNumber) {
+    char deviceNameUTF8[128] = {0};
+    char deviceUniqueIdUTF8[128] = {0};
+    if (info->GetDeviceName(deviceNumber, deviceNameUTF8, sizeof(deviceNameUTF8), deviceUniqueIdUTF8, sizeof(deviceUniqueIdUTF8), NULL, 0)) {
+        return false;
+    }
+    if (strncmp("FaceTime", deviceNameUTF8, 8) == 0) {
+        return false; // Ignore FaceTime HD Camera (Built-in)
+    }
+    return true;
+}
+
 class CapturerTrackSource : public webrtc::VideoTrackSource {
  public:
   static rtc::scoped_refptr<CapturerTrackSource> Create() {
@@ -81,6 +93,10 @@ class CapturerTrackSource : public webrtc::VideoTrackSource {
     }
     int num_devices = info->NumberOfDevices();
     for (int i = 0; i < num_devices; ++i) {
+      if (!srs_filter_cameras_without_facetime(info.get(), (uint32_t)i)) {
+          continue;
+      }
+
       capturer = absl::WrapUnique(
           webrtc::test::VcmCapturer::Create(kWidth, kHeight, kFps, i));
       if (capturer) {
@@ -130,6 +146,7 @@ bool Conductor::InitializePeerConnection() {
 
   if (!signaling_thread_.get()) {
     signaling_thread_ = rtc::Thread::CreateWithSocketServer();
+    signaling_thread_->SetName("signaling_thread", nullptr);
     signaling_thread_->Start();
   }
   peer_connection_factory_ = webrtc::CreatePeerConnectionFactory(
@@ -429,6 +446,52 @@ void Conductor::DisconnectFromServer() {
     client_->SignOut();
 }
 
+void srs_use_h264_if_possible(rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> peer_connection_factory_, rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection_) {
+    if (peer_connection_factory_ == nullptr || peer_connection_ == nullptr) {
+        return;
+    }
+
+    auto best_match = [](const webrtc::RtpCodecCapability& codec) {
+        bool packetization = false;
+        bool profile = false;
+        for (auto& [key, value] : codec.parameters) {
+            if (key == "packetization-mode" && value == "1") {
+                packetization = true;
+            } else if (key == "profile-level-id" && value == "42e01f") {
+                profile = true;
+            }
+        }
+        return packetization && profile;
+    };
+
+    auto sender_video_codecs = peer_connection_factory_->GetRtpSenderCapabilities(cricket::MEDIA_TYPE_VIDEO);
+    std::vector<webrtc::RtpCodecCapability> codecs;
+    for (const auto& codec : sender_video_codecs.codecs) {
+        if (codec.name == "H264" && best_match(codec)) {
+            codecs.push_back(codec);
+        }
+    }
+    for (const auto& codec : sender_video_codecs.codecs) {
+        if (codec.name == "H264" && !best_match(codec)) {
+            codecs.push_back(codec);
+        }
+    }
+    for (const auto& codec : sender_video_codecs.codecs) {
+        if (codec.name != "H264") {
+            codecs.push_back(codec);
+        }
+    }
+
+    std::vector<rtc::scoped_refptr<webrtc::RtpTransceiverInterface>> transceivers = peer_connection_->GetTransceivers();
+    for (const auto& transceiver : transceivers) {
+        auto sender = transceiver->sender();
+        if (!sender || sender->media_type() != cricket::MEDIA_TYPE_VIDEO) {
+            continue;
+        }
+        transceiver->SetCodecPreferences(codecs);
+    }
+}
+
 void Conductor::ConnectToPeer(int peer_id) {
   RTC_DCHECK(peer_id_ == -1);
   RTC_DCHECK(peer_id != -1);
@@ -440,6 +503,8 @@ void Conductor::ConnectToPeer(int peer_id) {
   }
 
   if (InitializePeerConnection()) {
+    srs_use_h264_if_possible(peer_connection_factory_, peer_connection_);
+
     peer_id_ = peer_id;
     peer_connection_->CreateOffer(
         this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
